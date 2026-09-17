@@ -2762,7 +2762,7 @@ describe("HyperframesPlayer retained runtime data", () => {
   });
 });
 
-describe("HyperframesPlayer asset-ready gate (D-736)", () => {
+describe("HyperframesPlayer asset-ready gate", () => {
   type PlayerInternal = HTMLElement & {
     iframe: HTMLIFrameElement;
     _ready: boolean;

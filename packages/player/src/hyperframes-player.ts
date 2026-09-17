@@ -33,8 +33,8 @@ const MAX_PLAYBACK_RATE = 5;
 const SANDBOX_ORIGIN_ATTR = "sandbox-origin";
 const RUNTIME_DATA_DELIVERY_TIMEOUT_MS = 10_000;
 // Bounds how long the player waits for a same-origin composition's media,
-// images and fonts before playing anyway (D-736) — a stuck asset must not
-// block playback forever.
+// images and fonts before playing anyway — a stuck asset must not block
+// playback forever.
 const ASSETS_READY_TIMEOUT_MS = 8_000;
 const ASSETS_LOADING_ATTR = "assets-loading";
 // HTMLMediaElement.HAVE_FUTURE_DATA per spec — used as a literal because not
