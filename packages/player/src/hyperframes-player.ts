@@ -32,6 +32,17 @@ const MIN_PLAYBACK_RATE = 0.1;
 const MAX_PLAYBACK_RATE = 5;
 const SANDBOX_ORIGIN_ATTR = "sandbox-origin";
 const RUNTIME_DATA_DELIVERY_TIMEOUT_MS = 10_000;
+// Bounds how long the player waits for a same-origin composition's media,
+// images and fonts before playing anyway (D-736) — a stuck asset must not
+// block playback forever.
+const ASSETS_READY_TIMEOUT_MS = 8_000;
+const ASSETS_LOADING_ATTR = "assets-loading";
+// HTMLMediaElement.HAVE_FUTURE_DATA per spec — used as a literal because not
+// every DOM implementation defines the named static (e.g. happy-dom leaves
+// it undefined, which would make `readyState < HTMLMediaElement.HAVE_FUTURE_DATA`
+// silently always false).
+const HAVE_FUTURE_DATA = 3;
+const ASSETS_TIMED_OUT = Symbol("assets-ready-timeout");
 
 export type ColorGradingTarget =
   | string
@@ -95,6 +106,8 @@ class HyperframesPlayer extends HTMLElement {
   private probe: CompositionProbe;
 
   private _ready = false;
+  private _assetsReady = false;
+  private _pendingPlay = false;
   private _currentTime = 0;
   private _duration = 0;
   private _paused = true;
@@ -343,7 +356,13 @@ class HyperframesPlayer extends HTMLElement {
     return this._scenes;
   }
 
+  // fallow-ignore-next-line complexity
   play() {
+    if (this._ready && !this._assetsReady) {
+      this._pendingPlay = true;
+      return;
+    }
+    this._pendingPlay = false;
     this.posterEl?.remove();
     this.posterEl = null;
     if (this._duration > 0 && this._currentTime >= this._duration) this.seek(0);
@@ -481,6 +500,13 @@ class HyperframesPlayer extends HTMLElement {
   }
   get ready() {
     return this._ready;
+  }
+
+  /** True once the composition's media, images and fonts have loaded (or the
+   *  8s wait timed out) — mirrors the `assetsready` event. Always true for
+   *  cross-origin compositions, which the player has no DOM access to wait on. */
+  get assetsReady() {
+    return this._assetsReady;
   }
 
   get playbackRate() {
@@ -947,6 +973,7 @@ class HyperframesPlayer extends HTMLElement {
 
     this._replayBridgeState();
     this._setIframeMediaMuted(this.muted);
+    this._waitForAssetsReady(doc);
     if (this.hasAttribute("autoplay")) this.play();
   }
 
@@ -961,14 +988,108 @@ class HyperframesPlayer extends HTMLElement {
       this._compositionHeight = compositionSize.height;
       this._rescale();
     }
-    try {
-      const doc = this.iframe.contentDocument;
-      if (doc) this._media.setupFromIframe(doc);
-    } catch {
-      /* cross-origin */
-    }
+    const doc = this._getSameOriginIframeDocument();
+    if (doc) this._media.setupFromIframe(doc);
     this._setIframeMediaMuted(this.muted);
+    this._waitForAssetsReady(doc);
     if (this.hasAttribute("autoplay")) this.play();
+  }
+
+  /** Gates play() on the composition's media/images/fonts, bounded by
+   *  ASSETS_READY_TIMEOUT_MS. Settles synchronously when there's nothing to
+   *  wait on, so the common case keeps today's immediate-autoplay behavior. */
+  private _waitForAssetsReady(doc: Document | null): void {
+    this._assetsReady = false;
+
+    const scan = doc && this._scanPendingAssets(doc);
+    if (
+      !doc ||
+      !scan ||
+      (scan.pendingMedia.length === 0 && scan.pendingImages.length === 0 && !scan.fontsLoading)
+    ) {
+      this._settleAssetsReady();
+      return;
+    }
+
+    this.setAttribute(ASSETS_LOADING_ATTR, "");
+    this.shaderLoader.showAssetsLoading();
+
+    const timeout = new Promise<typeof ASSETS_TIMED_OUT>((resolve) =>
+      setTimeout(() => resolve(ASSETS_TIMED_OUT), ASSETS_READY_TIMEOUT_MS),
+    );
+    Promise.race([this._collectAssetPromises(doc, scan), timeout]).then((result) => {
+      if (result === ASSETS_TIMED_OUT) this._warnStuckAssets(doc);
+      this._settleAssetsReady();
+    });
+  }
+
+  /** One DOM pass for everything not yet ready — shared by the up-front
+   *  already-loaded check and the promise-collection path below it. */
+  private _scanPendingAssets(doc: Document): {
+    pendingMedia: HTMLMediaElement[];
+    pendingImages: HTMLImageElement[];
+    fontsLoading: boolean;
+  } {
+    const pendingMedia = Array.from(doc.querySelectorAll("video, audio"))
+      .filter(isRealmHtmlMediaElement)
+      .filter((el) => el.readyState < HAVE_FUTURE_DATA);
+    const pendingImages = Array.from(doc.querySelectorAll("img")).filter((img) => !img.complete);
+    const fontsLoading = doc.fonts?.status === "loading";
+    return { pendingMedia, pendingImages, fontsLoading };
+  }
+
+  /** Timeout diagnostic. Re-scans (rather than reusing the original scan)
+   *  since some assets may have resolved in the 8s since. */
+  private _warnStuckAssets(doc: Document): void {
+    const { pendingMedia, pendingImages, fontsLoading } = this._scanPendingAssets(doc);
+    console.warn(
+      `[hyperframes-player] assets-loading timed out after ${ASSETS_READY_TIMEOUT_MS}ms — playing anyway`,
+      {
+        stuckMedia: pendingMedia.map(
+          (el) => el.currentSrc || el.getAttribute("src") || `<${el.tagName.toLowerCase()}>`,
+        ),
+        stuckImages: pendingImages.map(
+          (img) => img.currentSrc || img.getAttribute("src") || "<img>",
+        ),
+        fontsLoading,
+      },
+    );
+  }
+
+  private _settleAssetsReady(): void {
+    if (this._assetsReady) return;
+    this._assetsReady = true;
+    this.removeAttribute(ASSETS_LOADING_ATTR);
+    this.shaderLoader.hide();
+    this.dispatchEvent(new Event("assetsready"));
+    if (this._pendingPlay) this.play();
+  }
+
+  private _collectAssetPromises(
+    doc: Document,
+    { pendingMedia, pendingImages, fontsLoading }: ReturnType<typeof this._scanPendingAssets>,
+  ): Promise<void> {
+    const mediaReady = pendingMedia.map(
+      (el) =>
+        new Promise<void>((resolve) => {
+          const onSettled = () => {
+            el.removeEventListener("canplay", onSettled);
+            el.removeEventListener("error", onSettled);
+            resolve();
+          };
+          el.addEventListener("canplay", onSettled);
+          el.addEventListener("error", onSettled);
+        }),
+    );
+
+    const imagesReady = pendingImages.map((img) =>
+      img.decode ? img.decode().catch(() => {}) : Promise.resolve(),
+    );
+
+    const fontsReady =
+      fontsLoading && doc.fonts ? doc.fonts.ready.then(() => {}) : Promise.resolve();
+
+    return Promise.all([...mediaReady, ...imagesReady, fontsReady]).then(() => {});
   }
 
   private _rescale() {
@@ -1005,6 +1126,9 @@ class HyperframesPlayer extends HTMLElement {
     this._directTimelineAdapter = null;
     this._directTimelineClock.stop();
     this._stopParentTickClock();
+    this._assetsReady = false;
+    this._pendingPlay = false;
+    this.removeAttribute(ASSETS_LOADING_ATTR);
     this.shaderLoader.reset();
     this._media.resetForIframeLoad();
     this.probe.start();

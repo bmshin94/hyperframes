@@ -2761,3 +2761,110 @@ describe("HyperframesPlayer retained runtime data", () => {
     expect(applied[0]?.detail).toEqual({ channel: "captions", requestId: requests[1] });
   });
 });
+
+describe("HyperframesPlayer asset-ready gate (D-736)", () => {
+  type PlayerInternal = HTMLElement & {
+    iframe: HTMLIFrameElement;
+    _ready: boolean;
+    _pendingPlay: boolean;
+    assetsReady: boolean;
+    _waitForAssetsReady(doc: Document | null): void;
+    _onIframeLoad(): void;
+    play(): void;
+  };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+  });
+
+  // A bare iframe fires its own async `load` a few ms after append, which
+  // resets _assetsReady — await it first so it can't land mid-test.
+  async function createConnectedPlayer(): Promise<PlayerInternal> {
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+    await new Promise<void>((resolve) => {
+      player.iframe.addEventListener("load", () => resolve(), { once: true });
+    });
+    player._ready = true;
+    return player;
+  }
+
+  // A composition doc with one video stuck at readyState 0 — the shared
+  // "something is still loading" fixture for the defer/timeout tests below.
+  function createStalledVideoDoc(): { doc: Document; video: HTMLVideoElement } {
+    const doc = document.implementation.createHTMLDocument("composition");
+    const video = doc.createElement("video");
+    Object.defineProperty(video, "readyState", { value: 0, configurable: true });
+    doc.body.appendChild(video);
+    return { doc, video };
+  }
+
+  it("settles immediately for a cross-origin composition (doc === null)", async () => {
+    const player = await createConnectedPlayer();
+
+    player._waitForAssetsReady(null);
+
+    expect(player.assetsReady).toBe(true);
+    expect(player.hasAttribute("assets-loading")).toBe(false);
+
+    player.remove();
+  });
+
+  it("defers play() until a pending video settles, then plays and clears the overlay attribute", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player._waitForAssetsReady(doc);
+    expect(player.assetsReady).toBe(false);
+    expect(player.hasAttribute("assets-loading")).toBe(true);
+
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    video.dispatchEvent(new Event("canplay"));
+    // A macrotask flush drains the whole promise chain regardless of its
+    // depth (resolved media promise -> Promise.all -> Promise.race -> settle).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player.hasAttribute("assets-loading")).toBe(false);
+    expect(player._pendingPlay).toBe(false);
+    expect(playSpy).toHaveBeenCalledTimes(1);
+
+    player.remove();
+  });
+
+  it("plays anyway once the 8s timeout elapses for an asset that never settles", async () => {
+    // Real timers for the initial (blank) iframe load, then switch to fake
+    // timers so the 8s asset-ready timeout can be advanced instantly.
+    const player = await createConnectedPlayer();
+    vi.useFakeTimers();
+    try {
+      const { doc } = createStalledVideoDoc();
+      stubIframeContentDocument(player.iframe, doc);
+
+      player._waitForAssetsReady(doc);
+      player.play();
+      expect(player._pendingPlay).toBe(true);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await vi.advanceTimersByTimeAsync(8_000);
+
+      expect(player.assetsReady).toBe(true);
+      expect(player._pendingPlay).toBe(false);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls[0]?.[0]).toContain("assets-loading timed out");
+
+      player.remove();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
