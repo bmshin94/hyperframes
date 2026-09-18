@@ -108,6 +108,7 @@ class HyperframesPlayer extends HTMLElement {
   private _ready = false;
   private _assetsReady = false;
   private _pendingPlay = false;
+  private _assetsGeneration = 0;
   private _currentTime = 0;
   private _duration = 0;
   private _paused = true;
@@ -225,6 +226,8 @@ class HyperframesPlayer extends HTMLElement {
     this.controlsApi = null;
     this._paused = true;
     this._ready = false;
+    this._pendingPlay = false;
+    this._assetsGeneration++;
     this._runtimeBridgeReady = false;
     this._rejectAllRuntimeDataDeliveries("Player disconnected before runtime data was applied");
   }
@@ -1000,6 +1003,10 @@ class HyperframesPlayer extends HTMLElement {
    *  wait on, so the common case keeps today's immediate-autoplay behavior. */
   private _waitForAssetsReady(doc: Document | null): void {
     this._assetsReady = false;
+    // Invalidates any earlier wait still in flight (a composition swap, or
+    // disconnect, mid-wait) — its eventual settle checks this and no-ops
+    // rather than resolving a since-superseded generation.
+    const generation = ++this._assetsGeneration;
 
     const scan = doc && this._scanPendingAssets(doc);
     if (
@@ -1007,7 +1014,7 @@ class HyperframesPlayer extends HTMLElement {
       !scan ||
       (scan.pendingMedia.length === 0 && scan.pendingImages.length === 0 && !scan.fontsLoading)
     ) {
-      this._settleAssetsReady();
+      this._settleAssetsReady(generation);
       return;
     }
 
@@ -1018,8 +1025,9 @@ class HyperframesPlayer extends HTMLElement {
       setTimeout(() => resolve(ASSETS_TIMED_OUT), ASSETS_READY_TIMEOUT_MS),
     );
     Promise.race([this._collectAssetPromises(doc, scan), timeout]).then((result) => {
+      if (generation !== this._assetsGeneration) return;
       if (result === ASSETS_TIMED_OUT) this._warnStuckAssets(doc);
-      this._settleAssetsReady();
+      this._settleAssetsReady(generation);
     });
   }
 
@@ -1056,8 +1064,8 @@ class HyperframesPlayer extends HTMLElement {
     );
   }
 
-  private _settleAssetsReady(): void {
-    if (this._assetsReady) return;
+  private _settleAssetsReady(generation: number): void {
+    if (generation !== this._assetsGeneration || this._assetsReady) return;
     this._assetsReady = true;
     this.removeAttribute(ASSETS_LOADING_ATTR);
     this.shaderLoader.hide();
@@ -1128,6 +1136,7 @@ class HyperframesPlayer extends HTMLElement {
     this._stopParentTickClock();
     this._assetsReady = false;
     this._pendingPlay = false;
+    this._assetsGeneration++;
     this.removeAttribute(ASSETS_LOADING_ATTR);
     this.shaderLoader.reset();
     this._media.resetForIframeLoad();

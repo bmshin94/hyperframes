@@ -2867,4 +2867,64 @@ describe("HyperframesPlayer asset-ready gate", () => {
       vi.useRealTimers();
     }
   });
+
+  it("ignores a superseded wait's settle after a composition swap mid-wait", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc: docA, video: videoA } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, docA);
+    player._waitForAssetsReady(docA);
+
+    // Simulates a src/srcdoc swap arriving while A's wait is still in flight,
+    // then B's own ready handler firing (which is what real navigation does:
+    // _onIframeLoad clears _ready, the new composition's ready handler sets
+    // it again before calling _waitForAssetsReady).
+    player._onIframeLoad();
+    player._ready = true;
+    const { doc: docB, video: videoB } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, docB);
+    player._waitForAssetsReady(docB);
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    videoA.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A's stale settle must not mark B ready or play it — B's own video is
+    // still stuck.
+    expect(player.assetsReady).toBe(false);
+    expect(player._pendingPlay).toBe(true);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    videoB.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player._pendingPlay).toBe(false);
+    expect(playSpy).toHaveBeenCalledTimes(1);
+
+    player.remove();
+  });
+
+  it("does not resume play() after disconnect once a pending wait settles late", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+    player._waitForAssetsReady(doc);
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player.remove();
+    video.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(playSpy).not.toHaveBeenCalled();
+  });
 });

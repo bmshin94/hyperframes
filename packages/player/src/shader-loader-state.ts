@@ -64,6 +64,9 @@ export class ShaderLoaderState {
       this.hide();
       return;
     }
+    // showAssetsLoading() may have left "Loading assets" here for a prior
+    // show; this path owns the label whenever it's the one drawing the panel.
+    this._el.root.setAttribute("aria-label", "Preparing scene transitions");
 
     const progress =
       typeof status.progress === "number" && Number.isFinite(status.progress) ? status.progress : 0;
