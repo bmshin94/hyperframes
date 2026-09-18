@@ -226,8 +226,7 @@ class HyperframesPlayer extends HTMLElement {
     this.controlsApi = null;
     this._paused = true;
     this._ready = false;
-    this._pendingPlay = false;
-    this._assetsGeneration++;
+    this._invalidateAssetsWait();
     this._runtimeBridgeReady = false;
     this._rejectAllRuntimeDataDeliveries("Player disconnected before runtime data was applied");
   }
@@ -243,6 +242,7 @@ class HyperframesPlayer extends HTMLElement {
         if (!this.isConnected) break;
         if (val) {
           this._ready = false;
+          this._invalidateAssetsWait();
           this._runtimeBridgeReady = false;
           this._rejectAllRuntimeDataDeliveries(
             "Composition navigated before runtime data was applied",
@@ -253,6 +253,7 @@ class HyperframesPlayer extends HTMLElement {
       case "srcdoc":
         if (!this.isConnected) break;
         this._ready = false;
+        this._invalidateAssetsWait();
         this._runtimeBridgeReady = false;
         this._rejectAllRuntimeDataDeliveries(
           "Composition navigated before runtime data was applied",
@@ -333,6 +334,7 @@ class HyperframesPlayer extends HTMLElement {
 
   private _reloadForSandboxOriginPolicy(): void {
     this._ready = false;
+    this._invalidateAssetsWait();
     this._runtimeBridgeReady = false;
     this._rejectAllRuntimeDataDeliveries("Sandbox policy changed before runtime data was applied");
     const srcdoc = this.getAttribute("srcdoc");
@@ -817,6 +819,7 @@ class HyperframesPlayer extends HTMLElement {
     // replaced, where it can only end in a delivery timeout rather than the immediate,
     // explanatory rejection the caller gets from every other navigating path.
     this._ready = false;
+    this._invalidateAssetsWait();
     this._runtimeBridgeReady = false;
     this._rejectAllRuntimeDataDeliveries("Shader options changed before runtime data was applied");
     if (getShaderModeFromElement(this) !== "player") this.shaderLoader.reset();
@@ -1073,6 +1076,16 @@ class HyperframesPlayer extends HTMLElement {
     if (this._pendingPlay) this.play();
   }
 
+  /** Abandons any in-flight asset wait — every `_ready = false` site calls
+   *  this first, so a stale wait's settle can't apply to what comes next. */
+  private _invalidateAssetsWait(): void {
+    this._assetsReady = false;
+    this._pendingPlay = false;
+    this._assetsGeneration++;
+    this.removeAttribute(ASSETS_LOADING_ATTR);
+    this.shaderLoader.hide();
+  }
+
   private _collectAssetPromises(
     doc: Document,
     { pendingMedia, pendingImages, fontsLoading }: ReturnType<typeof this._scanPendingAssets>,
@@ -1134,10 +1147,7 @@ class HyperframesPlayer extends HTMLElement {
     this._directTimelineAdapter = null;
     this._directTimelineClock.stop();
     this._stopParentTickClock();
-    this._assetsReady = false;
-    this._pendingPlay = false;
-    this._assetsGeneration++;
-    this.removeAttribute(ASSETS_LOADING_ATTR);
+    this._invalidateAssetsWait();
     this.shaderLoader.reset();
     this._media.resetForIframeLoad();
     this.probe.start();
